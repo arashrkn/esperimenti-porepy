@@ -1,7 +1,7 @@
 '''
 Colonna 1d.
-Evolvo concentrazione di un soluto (trasporto e reazione) e di un precipitato (sola reazione).
-Sia trasporto che reazione impliciti.
+Evolvo concentrazione di un soluto (diffusione e reazione) e di un precipitato (sola reazione).
+Sia diffusione che reazione impliciti.
 '''
 
 import numpy as np
@@ -10,7 +10,7 @@ from porepy.numerics.ad.operators import Scalar, Array
 import scipy.sparse.linalg as sps
 
 gb = pp.meshing.cart_grid([], [30, 1], physdims=[10, 1])
-exporter = pp.Exporter(gb, file_name='soluzione', folder_name='out/1906_2/')
+exporter = pp.Exporter(gb, file_name='soluzione', folder_name='out/2206/')
 g, d = [(g, d) for g, d in gb][0]
 
 
@@ -20,7 +20,7 @@ d[pp.STATE] = {}
 
 TAU_R = 10
 B = 0.8
-DT = 0.5
+DT = 1.5
 T = 75
 
 ''' soluto '''
@@ -37,10 +37,9 @@ bc = pp.BoundaryCondition(g, facce_bordo, tipi_bc)
 
 porosita = np.ones(g.num_cells)
 
-darcy = np.zeros(g.num_faces)
-darcy[g.face_normals[0, :] == 1] = 0.2
+diffusivita = pp.SecondOrderTensor(np.ones(g.num_cells) * 0.3)
 
-parametri_trasporto = {"bc": bc, "bc_values": valori_bc, "mass_weight": porosita, "darcy_flux": darcy}
+parametri_trasporto = {"bc": bc, "bc_values": valori_bc, "mass_weight": porosita, "second_order_tensor": diffusivita}
 pp.initialize_default_data(g, d, 'transport', parametri_trasporto)
 
 d[pp.STATE]['soluto'] = np.zeros(g.num_cells)
@@ -64,14 +63,14 @@ precipitato_0 = Array(d[pp.STATE]['precipitato_0'])
 
 div = pp.ad.Divergence([g])
 bound_ad = pp.ad.BoundaryCondition('transport', grids=[g])
-upwind = pp.ad.UpwindAd('transport', [g])
+mpfa = pp.ad.MpfaAd('transport', [g])
 massa = pp.ad.MassMatrixAd('transport', [g])
 
 r = 0.5*precipitato * (Scalar(1) - (1/B**2)*soluto*soluto)/TAU_R
 # r = (Scalar(1) - (1/B**2)*soluto*soluto)/TAU_R
 
-lhs_soluto = massa.mass/DT*soluto + div*upwind.upwind*soluto - r
-rhs_soluto = massa.mass/DT*soluto_0 + div*upwind.rhs*bound_ad
+lhs_soluto = massa.mass/DT*soluto + div*mpfa.flux*soluto - r
+rhs_soluto = massa.mass/DT*soluto_0 - div * mpfa.bound_flux * bound_ad
 eqn_soluto = pp.ad.Expression(lhs_soluto - rhs_soluto, dof, name='eqn_soluto')
 
 lhs_precipitato = massa.mass/DT*precipitato + r
@@ -82,9 +81,6 @@ equation_manager.equations += [eqn_soluto, eqn_precipitato]
 
 
 ''' SOLUZIONE '''
-
-# TODO: Forse qui dovrei far convergere la soluzione di modo che
-# le condizioni iniziali siano compatibili con le equazioni
 
 d[pp.STATE]['soluto'][:] = d[pp.STATE]['soluto_0']
 d[pp.STATE]['precipitato'][:] = d[pp.STATE]['precipitato_0']
