@@ -9,10 +9,15 @@ import porepy as pp
 from porepy.numerics.ad.operators import Scalar, Array
 from porepy.numerics.fv.generaltpfaad import GeneralTpfaAd
 import scipy.sparse as sps
+import matplotlib
+import matplotlib.pyplot as plt
+from helpers.upwind import Upwind
+from helpers.trasmissibilita import trasmissibilita_da_permeabilita_
+
 
 X = 10
-Y = 1
-gb = pp.meshing.cart_grid([], [120, 1], physdims=[X, Y])
+Y = 10
+gb = pp.meshing.cart_grid([], [20, 20], physdims=[X, Y])
 exporter = pp.Exporter(gb, file_name='soluzione', folder_name='out/0707/')
 g, d = [(g, d) for g, d in gb][0]
 
@@ -21,27 +26,28 @@ d[pp.PRIMARY_VARIABLES] = {
     'pressione': {'cells': 1},
     'soluto': {'cells': 1},
     'precipitato': {'cells': 1},
-    'porosita': {'cells': 1},
 }
 d[pp.STATE] = {}
 
-# T = 30
-T = 2
+T = 40
 DT = 0.5
 
-TAU_R = 10
-B = 0.8
+TAU_R = 100
+# MAX nel senso che per questi valori non ho più dissoluzione/precipitazione
+SOLUTO_MAX = 0.05
+PRECIPITATO_MAX = 1.0
 
-# ETA = 0.01
-ETA = 0.8
+PHI_INERTE = 0.9
+ETA = 10
 K0 = 1
-PHI0 = 1
+PHI0 = 0.1
 
 facce_bordo = g.tags["domain_boundary_faces"].nonzero()[0]
 
 ''' darcy '''
 valori_bc = np.zeros(g.num_faces)
-valori_bc[facce_bordo[g.face_centers[0, facce_bordo] == 0]] = 2
+valori_bc[facce_bordo[g.face_centers[0, facce_bordo] == X]] = 2
+# valori_bc[facce_bordo[g.face_centers[0, facce_bordo] == 0]] = 2
 
 tipi_bc = np.full(facce_bordo.size, 'neu')
 tipi_bc[g.face_centers[0, facce_bordo] == 0] = 'dir'
@@ -55,7 +61,6 @@ parametri_darcy = {"bc": bc, "bc_values": valori_bc, "second_order_tensor": perm
 pp.initialize_default_data(g, d, 'flow', parametri_darcy)
 
 d[pp.STATE]['pressione'] = np.zeros(g.num_cells)
-d[pp.STATE]['pressione_0'] = np.zeros(g.num_cells)
 
 ''' soluto '''
 valori_bc = np.zeros(g.num_faces)
@@ -65,27 +70,36 @@ tipi_bc[g.face_centers[1, facce_bordo] == 0] = 'neu'
 tipi_bc[g.face_centers[1, facce_bordo] == Y] = 'neu'
 bc = pp.BoundaryCondition(g, facce_bordo, tipi_bc)
 
-porosita = np.ones(g.num_cells)
-
 # NOTE: Il vero flusso di Darcy lo definisco più avanti.
 darcy = np.full(g.num_cells, np.nan)
-parametri_trasporto = {"bc": bc, "bc_values": valori_bc, "mass_weight": porosita, "darcy_flux": darcy}
+parametri_trasporto = {"bc": bc, "bc_values": valori_bc, "mass_weight": np.ones(g.num_cells), "darcy_flux": darcy}
 pp.initialize_default_data(g, d, 'transport', parametri_trasporto)
 
 d[pp.STATE]['soluto'] = np.zeros(g.num_cells)
 d[pp.STATE]['soluto_0'] = np.zeros(g.num_cells)
-d[pp.STATE]['soluto_0'][:] = 0
+d[pp.STATE]['soluto_0'][:] = 0.0
 
-''' precipitato '''
+''' precipitato e porosità '''
+def porosita_da_precipitato(precipitato):
+    porosita = (1 - PHI_INERTE)*(1 + ETA*precipitato)**-1
+    return porosita
+porosita_da_precipitato_ad = pp.ad.Function(porosita_da_precipitato, 'porosita_da_precipitato')
+
 d[pp.STATE]['precipitato'] = np.zeros(g.num_cells)
 d[pp.STATE]['precipitato_0'] = np.zeros(g.num_cells)
-d[pp.STATE]['precipitato_0'][g.cell_centers[0, :] <= 5] = 1
 
-''' porosita '''
-d[pp.STATE]['porosita'] = np.zeros(g.num_cells)
-d[pp.STATE]['porosita_0'] = np.zeros(g.num_cells)
-d[pp.STATE]['porosita_0'][:] = 0.1
+d[pp.STATE]['precipitato_0'][:] = 0.0
+centro = (4 <= g.cell_centers[0, :]) & (g.cell_centers[0, :] <= 6) & (4 <= g.cell_centers[1, :]) & (g.cell_centers[1, :] <= 6)
+d[pp.STATE]['precipitato_0'][centro] = 1.0
+# d[pp.STATE]['precipitato_0'][:] = g.cell_centers[0,:] / 10 * 2
+# d[pp.STATE]['precipitato_0'][g.cell_centers[0, :] <= 5] = 1
+# d[pp.STATE]['precipitato_0'][:] = 1 - g.cell_centers[0,:]/X
 
+''' quantità derivate '''
+d[pp.STATE]['_porosita'] = np.ones(g.num_cells)
+# d[pp.STATE]['rsoluto'] = np.ones(g.num_cells)
+d[pp.STATE]['rprecipitato'] = np.ones(g.num_cells)
+# d[pp.STATE]['equilibrio_soluto'] = np.ones(g.num_cells)
 
 ''' EQUAZIONI '''
 
@@ -95,56 +109,30 @@ equation_manager = pp.ad.EquationManager(gb, dof)
 pressione = equation_manager.merge_variables([(g, 'pressione')])
 soluto = equation_manager.merge_variables([(g, 'soluto')])
 precipitato = equation_manager.merge_variables([(g, 'precipitato')])
-porosita = equation_manager.merge_variables([(g, 'porosita')])
 
-pressione_0 = Array(d[pp.STATE]['pressione_0'])
 soluto_0 = Array(d[pp.STATE]['soluto_0'])
 precipitato_0 = Array(d[pp.STATE]['precipitato_0'])
-porosita_0 = Array(d[pp.STATE]['porosita_0'])
+porosita_0 = porosita_da_precipitato_ad(precipitato_0)
 
 # NOTE: Questi due credo siano gli stessi, a prescindere da cosa sto discretizzando.
 div = pp.ad.Divergence([g])
 massa = pp.ad.MassMatrixAd('flow', [g])
 
+porosita = porosita_da_precipitato_ad(precipitato)
+
 ''' darcy '''
-
-def trasmissibilita_da_porosita_(g):
-    facce_segnate = np.vstack(g.cell_faces.nonzero())
-    J = facce_segnate.shape[1]
-    A = sps.dok_matrix((J, g.num_cells), dtype=np.float32)
-    for j in range(J):
-        idx_faccia = facce_segnate[0, j]
-        idx_cella = facce_segnate[1, j]
-        raggio = g.cell_centers[:, idx_cella] - g.face_centers[:, idx_faccia]
-        A[j, idx_cella] = g.face_areas[idx_faccia] * np.dot(raggio, g.face_normals[:, idx_faccia]) / np.linalg.norm(raggio)
-    A = np.abs(A)
-
-    righe = facce_segnate[0, :]
-    colonne = np.arange(J)
-    dati = np.ones(J)
-    B = sps.coo_matrix((dati, (righe, colonne)))
-    B = B / np.array(B.sum(axis=1))
-    B = sps.coo_matrix(B)
-
-    def trasmissibilita_da_porosita(porosita):
-        permeabilita = K0 / PHI0**2 * porosita**2
-        inv_mezze_trasmissibilita = (A * permeabilita)**-1
-        inv_trasmissibilita = B * inv_mezze_trasmissibilita
-        trasmissibilita_ = inv_trasmissibilita**-1
-        return trasmissibilita_
-
-    return trasmissibilita_da_porosita
-trasmissibilita_da_porosita_ad = pp.ad.Function(trasmissibilita_da_porosita_(g), 'trasmissibilita_da_porosita')
-
+trasmissibilita_da_permeabilita = trasmissibilita_da_permeabilita_(g)
+trasmissibilita_da_permeabilita_ad = pp.ad.Function(trasmissibilita_da_permeabilita, 'trasmissibilita_da_permeabilita')
 darcy_bc = pp.ad.BoundaryCondition('flow', grids=[g])
 
 # NOTE: Non posso usare tpfa normale perchè AD non propagherebbe lo jacobiano della permeabilità.
 tpfa = GeneralTpfaAd('flow')
 tpfa.discretize(g, d)
 
-flusso = tpfa.flux(trasmissibilita_da_porosita_ad(porosita), pressione, darcy_bc)
+permeabilita = Scalar(K0 / PHI0**2) * porosita*porosita
+flusso = tpfa.flux(trasmissibilita_da_permeabilita_ad(permeabilita), pressione, darcy_bc)
 
-lhs_darcy = div * flusso + massa.mass/DT * porosita
+lhs_darcy = div*flusso + massa.mass/DT*porosita
 rhs_darcy = massa.mass/DT*porosita_0
 eqn_darcy = pp.ad.Expression(lhs_darcy - rhs_darcy, dof, name='eqn_darcy')
 
@@ -153,47 +141,12 @@ equation_manager.equations += [eqn_darcy]
 ''' soluto e precipitato '''
 soluto_bc = pp.ad.BoundaryCondition('transport', grids=[g])
 
-r = 0.5*precipitato * (Scalar(1) - (1/B**2)*soluto*soluto)/TAU_R
+r_diss = precipitato/PRECIPITATO_MAX * (Scalar(1) - (1/SOLUTO_MAX**2)*soluto*soluto)/TAU_R
+r_prec = soluto/SOLUTO_MAX * (Scalar(1) - (1/PRECIPITATO_MAX**2)*precipitato*precipitato)/TAU_R
+# r_prec = 0
+r = r_diss - r_prec
 # r = (Scalar(1) - (1/B**2)*soluto*soluto)/TAU_R
-
-# # NOTE: Non DEVO usare upwind così: AD non sta propagando lo jacobiano del flusso.
-# upwind = pp.ad.UpwindAd('transport', [g])
-# lhs_soluto = massa.mass/DT*(porosita*soluto) + div*upwind.upwind*soluto - porosita*r
-# rhs_soluto = massa.mass/DT*(porosita_0*soluto_0) + div*upwind.rhs*soluto_bc
-
-class Upwind(pp.ad.operators.ApplicableOperator):
-    def __init__(self, keyword, g, data):
-        self.keyword = keyword
-        self.g = g
-        self.data = data
-        self._set_tree()
-
-    def apply(self, flusso, concentrazioni, valori_bc):
-        keyword = self.keyword
-        g = self.g
-        data = self.data
-        bc = data[pp.PARAMETERS][keyword]['bc']
-
-        div = g.cell_faces.T
-
-        flusso_val = flusso.val if isinstance(flusso, pp.ad.Ad_array) else flusso
-        flussi = np.einsum('ij,j->ij', div.toarray(), flusso_val)
-        upwind = sps.csr_matrix(1*(flussi > 0)).T
-
-        # NOTE: Su Neumann outflow ci pensa già upwind
-
-        facce_neumann_inflow = np.logical_and(np.any(flussi < 0, axis=0), bc.is_neu).nonzero()[0]
-        if facce_neumann_inflow.size > 0:
-            raise SystemError()
-
-        concentrazioni_facce = upwind * concentrazioni
-        concentrazioni_facce.val[bc.is_dir] = valori_bc[bc.is_dir]
-        concentrazioni_facce.jac[bc.is_dir, :] = 0
-        concentrazioni_facce.jac.eliminate_zeros()
-
-        res = concentrazioni_facce * flusso
-
-        return res
+# r = 0
 
 upwind = Upwind('transport', g, d)
 lhs_soluto = massa.mass/DT*(porosita*soluto) + div*upwind(flusso, soluto, soluto_bc) - porosita*r
@@ -207,24 +160,23 @@ eqn_precipitato = pp.ad.Expression(lhs_precipitato - rhs_precipitato, dof, name=
 
 equation_manager.equations += [eqn_soluto, eqn_precipitato]
 
-''' porosita '''
-log_ad = pp.ad.Function(pp.ad.log, 'log')
-lhs_porosita = log_ad(porosita) + ETA*precipitato
-rhs_porosita = log_ad(porosita_0) + ETA*precipitato_0
-# lhs_porosita =  ETA*massa.mass/DT*(porosita*precipitato) - ETA*massa.mass/DT*(porosita*precipitato_0) + massa.mass/DT*porosita
-# rhs_porosita =  massa.mass/DT*porosita_0
-eqn_porosita = pp.ad.Expression(lhs_porosita - rhs_porosita, dof, name='eqn_porosita')
-
-equation_manager.equations += [eqn_porosita]
-
-
 ''' SOLUZIONE '''
 
-d[pp.STATE]['pressione'] = d[pp.STATE]['pressione_0']
 d[pp.STATE]['soluto'][:] = d[pp.STATE]['soluto_0']
 d[pp.STATE]['precipitato'][:] = d[pp.STATE]['precipitato_0']
-d[pp.STATE]['porosita'][:] = d[pp.STATE]['porosita_0']
-exporter.write_vtu(['soluto', 'precipitato', 'pressione', 'porosita'], time_step=0)
+
+def scrivi(i):
+    d[pp.STATE]['_porosita'] = porosita_da_precipitato(d[pp.STATE]['precipitato'])
+    d[pp.STATE]['rsoluto'] = d[pp.STATE]['soluto'] * d[pp.STATE]['_porosita']
+    d[pp.STATE]['rprecipitato'] = d[pp.STATE]['precipitato'] * d[pp.STATE]['_porosita']
+    # d[pp.STATE]['equilibrio_soluto'] = B * d[pp.STATE]['porosita']
+    exporter.write_vtu(['soluto', 'precipitato', 'pressione', '_porosita', 'rsoluto', 'rprecipitato'], time_step=i)
+scrivi(0)
+
+def p(ad):
+    exp = pp.ad.Expression(ad, dof)
+    res = exp.to_ad(gb)
+    return res
 
 for i in np.arange(1, int(T/DT)):
     equation_manager.discretize(gb)
@@ -240,6 +192,7 @@ for i in np.arange(1, int(T/DT)):
             break
 
         incremento = sps.linalg.spsolve(jacobiano, nresiduale)
+        if np.any(np.isnan(incremento)): break
         dof.distribute_variable(incremento, additive=True)
 
         equation_manager.discretize(gb)
@@ -249,8 +202,8 @@ for i in np.arange(1, int(T/DT)):
         print('😓')
         break
 
-    exporter.write_vtu(['soluto', 'precipitato', 'pressione', 'porosita'], time_step=i)
+    if np.any(d[pp.STATE]['precipitato'] < -1e-3): raise SystemError
+
+    scrivi(i)
     d[pp.STATE]['soluto_0'][:] = d[pp.STATE]['soluto']
     d[pp.STATE]['precipitato_0'][:] = d[pp.STATE]['precipitato']
-    d[pp.STATE]['pressione_0'][:] = d[pp.STATE]['pressione']
-    d[pp.STATE]['porosita_0'][:] = d[pp.STATE]['porosita']
