@@ -4,3 +4,5 @@ gmsh_frac_file*
 _/*
 post
 __pycache__
+.ipynb_checkpoints
+scratch.ipynb
